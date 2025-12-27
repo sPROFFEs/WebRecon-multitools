@@ -4,7 +4,7 @@ A collection of **battle-tested scripts, automation wrappers, and one-liners** d
 
 These tools are built for **speed, modularity, and piping**. No bloat, just raw functionality to integrate into your existing recon pipelines.
 
-## 📂 Utilities
+## Utilities
 
 ### 1. `crtsh_enum.py`
 
@@ -51,7 +51,7 @@ pip3 install requests
 
 ---
 
-## 🚀 Usage
+## Usage
 
 ### Passive Recon (Certificate Enumeration)
 
@@ -88,7 +88,7 @@ These scripts are intended for authorized security auditing, Red Teaming engagem
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Got a better one-liner? Found a bug?
 
